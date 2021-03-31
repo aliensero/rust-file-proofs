@@ -142,7 +142,8 @@ fn run_pre_commit_phases<Tree: 'static + MerkleTreeTrait>(
             // Generate the data from which we will create a replica, we will then prove the continued
             // storage of that replica using the PoSt.
             let piece_bytes: Vec<u8> = (0..usize::from(sector_size_unpadded_bytes_amount))
-                .map(|_| rand::random::<u8>())
+                // .map(|_| rand::random::<u8>())
+                .map(|_| 0u8)
                 .collect();
 
             info!("*** Created piece file");
@@ -544,7 +545,7 @@ pub fn run_window_post_bench<Tree: 'static + MerkleTreeTrait>(
         info!("Preserving cache directory {:?}", cache_dir);
     } else {
         info!("Removing cache directory {:?}", cache_dir);
-        remove_dir_all(cache_dir)?;
+        //remove_dir_all(cache_dir)?;
     }
 
     let report = Report {
