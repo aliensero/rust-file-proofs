@@ -10,4 +10,5 @@ members = [
   "fr32",
   "sha2raw",
   "filecoin-hashers",
+  "fil-sha2raw-lib",
 ]

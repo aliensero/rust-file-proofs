@@ -7,8 +7,8 @@
 
 pub use digest::Digest;
 
-mod consts;
-mod platform;
+pub mod consts;
+pub mod platform;
 mod sha256;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod sha256_intrinsics;

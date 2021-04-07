@@ -1,0 +1,18 @@
+[package]
+name = "fil-sha2raw-lib"
+version = "0.1.0"
+authors = ["alien <weitaibin@foxmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = "1.3.4"
+sha2raw = { path = "../sha2raw", version = "^2.0.0"}
+
+[dependencies.lazy_static]
+version = "1.4.0"
+
+[lib]
+crate-type = ["staticlib"]
+name = "filsha256"
