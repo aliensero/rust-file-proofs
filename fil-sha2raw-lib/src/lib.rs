@@ -1,19 +1,26 @@
+use std::env;
 use lazy_static::lazy_static;
 use sha2raw::{platform::Implementation,consts::H256};
 use byteorder::{ByteOrder, BE};
+use log::{debug};
 lazy_static! {
     static ref IMPL: Implementation = Implementation::detect();
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn init(){
+    fil_logger::init();
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn filsha256_layer(state: &mut [u32;8], len: usize, blocks: &[[u8;32];14]){
-    println!("state {:?}",state);
+    debug!("state {:?}",state);
     let zero = [0u32;8];
     if *state == zero {
         state.copy_from_slice(&H256[..])
     }
     let l = len;
-    println!("blocks {:?} len {}",blocks,l);
+    debug!("blocks {:?} len {}",blocks,l);
     let mut tb = Vec::<&[u8]>::with_capacity(l);
     for i in 0..l{
         tb.push(&blocks[i][..]);
@@ -27,7 +34,7 @@ pub unsafe extern "C" fn filsha256_layer(state: &mut [u32;8], len: usize, blocks
 #[no_mangle]
 pub unsafe extern "C"  fn finish(state: &mut [u32;8],len: u64,ret: &mut [u8; 32]) {
 
-    println!("state {:?}",state);
+    debug!("state {:?}",state);
 
     let mut block0 = [0u8; 32];
     let mut block1 = [0u8; 32];
@@ -51,7 +58,7 @@ pub unsafe extern "C"  fn finish(state: &mut [u32;8],len: u64,ret: &mut [u8; 32]
 #[no_mangle]
 pub unsafe extern "C"  fn finish_with(state: &mut [u32;8],len: u64,block0: &[u8;32],ret: &mut [u8; 32]) {
     
-    println!("state {:?} len {}",state,len);
+    debug!("state {:?} len {}",state,len);
     
     let mut block1 = [0u8; 32];
 
@@ -64,7 +71,7 @@ pub unsafe extern "C"  fn finish_with(state: &mut [u32;8],len: u64,block0: &[u8;
 
     let mut c_state = [0u32;8];
     c_state.copy_from_slice(&state[..]);
-    println!("len {}",l);
+    debug!("len {}",l);
     IMPL.compress256(&mut c_state, &[&block0[..], &block1[..]][..]);
 
     let mut out = [0u8;32];
