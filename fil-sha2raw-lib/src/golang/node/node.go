@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"runtime/pprof"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ const PARENTCOUNTBASE = 6
 const PARENTCOUNTEXP = 8
 const PARENTCOUNT = PARENTCOUNTBASE + PARENTCOUNTEXP
 const NODESIZE = 32
+const timeTemplate = "2006-01-02 15:04:05"
 
 var log = logging.Logger("node")
 var cachedb = &CacheDB{}
@@ -33,11 +35,12 @@ func init() {
 }
 
 type CacheDB struct {
-	lk        sync.RWMutex
-	CacheSize uint64
-	Cache     map[uint64][]byte
-	Db        *leveldb.DB
-	CurNode   uint64
+	lk             sync.RWMutex
+	CacheSize      uint64
+	Cache          map[uint64][]byte
+	LastLayerCache []map[string][]byte
+	Db             *leveldb.DB
+	CurNode        uint64
 }
 
 func (db *CacheDB) Get(key []byte, node uint64, ro *opt.ReadOptions, lastLayer bool) ([]byte, error) {
@@ -47,7 +50,7 @@ func (db *CacheDB) Get(key []byte, node uint64, ro *opt.ReadOptions, lastLayer b
 		if node > db.CurNode {
 			return nil, xerrors.Errorf("node %v not ready", node)
 		}
-		if int64(db.CurNode)-int64(db.CacheSize) <= int64(node) {
+		if int64(db.CurNode)-int64(db.CacheSize) < int64(node) {
 			remainder := node % db.CacheSize
 			v := db.Cache[remainder]
 			return v, nil
@@ -55,15 +58,27 @@ func (db *CacheDB) Get(key []byte, node uint64, ro *opt.ReadOptions, lastLayer b
 			return db.Db.Get(key, ro)
 		}
 	} else {
-		return db.Db.Get(key, ro)
+		remainder := node % db.CacheSize
+		tmpcache := db.LastLayerCache[remainder]
+		v, ok := tmpcache[string(key)]
+		if ok {
+			return v, nil
+		}
+		v, err := db.Db.Get(key, ro)
+		if err != nil {
+			return nil, err
+		}
+		tmpcache = map[string][]byte{string(key): v}
+		db.LastLayerCache[remainder] = tmpcache
+		return v, err
 	}
 }
 
 func (db *CacheDB) Put(key []byte, value []byte, node uint64, wo *opt.WriteOptions) error {
+	remainder := node % db.CacheSize
 	db.lk.Lock()
 	defer db.lk.Unlock()
 	db.CurNode = node
-	remainder := node % db.CacheSize
 	db.Cache[remainder] = value
 	return db.Db.Put(key, value, wo)
 	// return nil
@@ -141,7 +156,11 @@ func (n *Node) Start(providerID []byte, sectorID []byte, ticket []byte, commd []
 				log.Debugf("loop default layer %v node %v tmpParentCacheBase %v", n.Layer, n.NodeIndex, tmpParentCacheBase)
 			}
 			for k, _ := range tmpParentCacheBase {
-				dbkey := fmt.Sprintf("%d-%d", n.Layer, k)
+				var ll uint32 = 1
+				if n.Layer%2 == 0 {
+					ll = 2
+				}
+				dbkey := fmt.Sprintf("%d-%d", ll, k)
 				data, err := n.Db.Get([]byte(dbkey), k, nil, false)
 				if err != nil {
 					log.Debug(fmt.Errorf("get layer %v node %v base parent node %v error %v", n.Layer, n.NodeIndex, k, err))
@@ -183,13 +202,22 @@ func (n *Node) Start(providerID []byte, sectorID []byte, ticket []byte, commd []
 		}
 	}
 	log.Debugf("\n-------------layer %v node %v nodehash %v-------------\n", n.Layer, n.NodeIndex, nodehash)
-	dbkey := fmt.Sprintf("%d-%d", n.Layer, n.NodeIndex)
+	var ll uint32 = 1
+	if n.Layer%2 == 0 {
+		ll = 2
+	}
+	dbkey := fmt.Sprintf("%d-%d", ll, n.NodeIndex)
 	err := n.Db.Put([]byte(dbkey), nodehash[:], n.NodeIndex, nil)
 	if err != nil {
 		log.Debug(fmt.Errorf("layer %v node %v db put error %v", n.Layer, n.NodeIndex, err))
 	}
 	n.Pub <- Node{Layer: n.Layer, NodeIndex: n.NodeIndex, Hash: nodehash}
-	n.ScheChan <- nil
+	go func() {
+		defer func() {
+			recover()
+		}()
+		n.ScheChan <- nil
+	}()
 	n.WriteChan <- nil
 	if n.LastNode {
 		n.WriteChan <- "end"
@@ -204,7 +232,11 @@ func (n *Node) FillExp() {
 	go func() {
 		for i := PARENTCOUNTBASE; i < PARENTCOUNT; i++ {
 			nid := n.ParentsIndex[i]
-			dbkey := fmt.Sprintf("%d-%d", n.Layer-1, nid)
+			var ll uint32 = 2
+			if n.Layer%2 == 0 {
+				ll = 1
+			}
+			dbkey := fmt.Sprintf("%d-%d", ll, nid)
 			ln, err := n.Db.Get([]byte(dbkey), nid, nil, true)
 			for err != nil {
 				log.Debug(fmt.Errorf("get layer %v node %v parent %v error %v", n.Layer, n.NodeIndex, i, err))
@@ -243,8 +275,9 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 
 	var nodeCnt uint64 = pc.NodeCnt
 
-	cachedb.CacheSize = nodeCnt
-	cachedb.Cache = make(map[uint64][]byte, nodeCnt)
+	cachedb.CacheSize = nodeCnt / 32
+	cachedb.Cache = make(map[uint64][]byte)
+	cachedb.LastLayerCache = make([]map[string][]byte, cachedb.CacheSize)
 	cachedb.Db = db
 
 	layerSize := pc.LayerSize
@@ -253,7 +286,7 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 	if parallelCnt > nodeCnt {
 		parallelCnt = nodeCnt
 	}
-	// ff, err := os.Open("512-layer-1")
+	// ff, err := os.Open("2-layer-1")
 	// if err != nil {
 	// 	log.Debug(fmt.Errorf("open 512-layer-1 error %v", err))
 	// 	return
@@ -262,18 +295,19 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 	for i := 1; i < layerSize; i++ {
 		var pub chan Node
 		var assiascnt uint64 = 0
-		scheChan := make(chan interface{}, parallelCnt)
+		scheChan := make(chan interface{})
 		wf := func(layer int, db *CacheDB) chan interface{} {
 			f, err := os.OpenFile(fmt.Sprintf("layer-%d", layer), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0755)
 			if err != nil {
 				log.Debug(fmt.Errorf("open file layer %d error %v", i, err))
 				return nil
 			}
-			writeChan := make(chan interface{}, parallelCnt)
+			writeChan := make(chan interface{})
 			wait.Add(1)
 			go func() {
 				defer wait.Done()
 				bt := time.Now()
+				log.Infof("layer %v begin %v", layer, bt.Format(timeTemplate))
 				var node uint64 = 0
 				leadEnd := false
 				for {
@@ -286,11 +320,15 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 							leadEnd = true
 						}
 					}
-					data, err := db.Get([]byte(fmt.Sprintf("%d-%d", layer, node)), node, nil, false)
+					var ll uint32 = 1
+					if layer%2 == 0 {
+						ll = 2
+					}
+					data, err := db.Get([]byte(fmt.Sprintf("%d-%d", ll, node)), node, nil, false)
 					for err != nil {
 						log.Debugf("db get error %v", err)
 						time.Sleep(time.Second)
-						data, err = db.Get([]byte(fmt.Sprintf("%d-%d", layer, node)), node, nil, false)
+						data, err = db.Get([]byte(fmt.Sprintf("%d-%d", ll, node)), node, nil, false)
 					}
 					log.Debugf("db.Get layer %d node %d data %v\n", layer, node, data)
 					// var vanillabuf [NODESIZE]byte
@@ -313,6 +351,7 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 				et := time.Now()
 				log.Infof("commplit %v time %v", f.Name(), et.Sub(bt))
 				f.Close()
+				close(writeChan)
 			}()
 			return writeChan
 		}
@@ -355,9 +394,7 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 				}
 				n.FillExp()
 			}
-			wait.Add(1)
 			go func() {
-				defer wait.Done()
 				n.Start(providerID, sectorID, ticket, commd)
 			}()
 			return n.Pub
@@ -376,19 +413,41 @@ func (pc *ParentsMapCache) Start(providerID, sectorID, ticket, commd []byte) {
 			pub = async(buf, i, assiascnt, pub)
 			assiascnt++
 		}
+		close(scheChan)
 		wait.Wait()
 	}
 }
 
 func Test2() {
+
+	f, err := os.OpenFile("cpuprofile", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Info(err)
+		return
+	}
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
+
 	// commd := []byte{252, 126, 146, 130, 150, 229, 22, 250, 173, 233, 134, 178, 143, 146, 212, 74, 79, 36, 185, 53, 72, 82, 35, 55, 106, 121, 144, 39, 188, 24, 248, 51}                                                     //2kib
 	// pc := ParentsMapCache{ParentCachePath: "/var/tmp1/filecoin-parents/v28-sdr-parent-652bae61e906c0732e9eb95b1217cfa6afcce221ff92a8aedf62fa778fa765bc.cache", NodeCnt: 64, LayerSize: 3, DbPath: "./test", ParallelCnt: 5} // 2KiB
-	commd := []byte{57, 86, 14, 123, 19, 169, 59, 7, 162, 67, 253, 39, 32, 255, 167, 203, 62, 29, 46, 80, 90, 179, 98, 158, 121, 244, 99, 19, 81, 44, 218, 6}                                                                      //512mib
-	pc := ParentsMapCache{ParentCachePath: "/var/tmp1/filecoin-parents/v28-sdr-parent-016f31daba5a32c5933a4de666db8672051902808b79d51e9b97da39ac9981d3.cache", NodeCnt: 16777216, LayerSize: 3, DbPath: "./test", ParallelCnt: 14} // 512MiB 16777216
+
+	// commd := []byte{57, 86, 14, 123, 19, 169, 59, 7, 162, 67, 253, 39, 32, 255, 167, 203, 62, 29, 46, 80, 90, 179, 98, 158, 121, 244, 99, 19, 81, 44, 218, 6}                                                                         //512mib
+	// pc := ParentsMapCache{ParentCachePath: "/var/tmp1/filecoin-parents/v28-sdr-parent-016f31daba5a32c5933a4de666db8672051902808b79d51e9b97da39ac9981d3.cache", NodeCnt: 16777216, LayerSize: 3, DbPath: "./test", ParallelCnt: 10000} // 512MiB 16777216
+
+	commd := []byte{1, 129, 226, 3, 146, 32, 32, 7, 126, 95, 222, 53, 197, 10, 147, 3, 165, 80, 9, 227, 73, 138, 78, 190, 223, 243, 156, 66, 183, 16, 183, 48, 216, 236, 122, 199, 175, 166, 62}                                       //32gib
+	pc := ParentsMapCache{ParentCachePath: "/var/tmp1/filecoin-parents/v28-sdr-parent-55c7d1e6bb501cc8be94438f89b577fddda4fafa71ee9ca72eabe2f0265aefa6.cache", NodeCnt: 1073741824, LayerSize: 12, DbPath: "./test", ParallelCnt: 100} // 32GiB 1073741824
+
 	providerID := []byte{9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9}
 	ticket := []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
 	sectorID := []byte{0, 0, 0, 0, 0, 0, 0, 0}
 	pc.Start(providerID, sectorID, ticket, commd)
+
+	fm, err := os.OpenFile("memprofile", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pprof.WriteHeapProfile(fm)
+	fm.Close()
 }
 
 func Test() {
